@@ -14,6 +14,7 @@ import (
 
 	"github.com/li17633543843-tech/bybit-bitget-arbitrage/internal/exchange/bitget"
 	"github.com/li17633543843-tech/bybit-bitget-arbitrage/internal/exchange/bybit"
+	"github.com/li17633543843-tech/bybit-bitget-arbitrage/internal/dashboard"
 	"github.com/li17633543843-tech/bybit-bitget-arbitrage/internal/ledger"
 	"github.com/li17633543843-tech/bybit-bitget-arbitrage/internal/market"
 	"github.com/li17633543843-tech/bybit-bitget-arbitrage/internal/orderbook"
@@ -35,6 +36,7 @@ func main() {
 	bitgetFee := flag.Float64("bitget-fee-bps", 6, "actual Bitget taker fee")
 	safetyBps := flag.Float64("buffer-bps", 3, "latency and slippage allowance")
 	maxAge := flag.Duration("max-book-age", 2*time.Second, "maximum accepted age of either book")
+	maxBookSkew := flag.Duration("max-book-skew", 500*time.Millisecond, "maximum timestamp difference between exchange books")
 	paperEnabled := flag.Bool("paper", false, "enable stateful four-leg paper trading")
 	window := flag.Int("window", 300, "rolling spread window")
 	warmup := flag.Int("warmup", 300, "samples required before paper entries")
@@ -42,15 +44,30 @@ func main() {
 	exitZ := flag.Float64("exit-z", .5, "absolute z-score used to close on convergence")
 	stopZ := flag.Float64("stop-z", 4, "absolute z-score stop")
 	maxHold := flag.Duration("max-hold", 2*time.Hour, "maximum paper position holding time")
+	minHold := flag.Duration("min-hold", 5*time.Second, "minimum holding time before convergence exit")
+	entryConfirm := flag.Duration("entry-confirm", 3*time.Second, "continuous same-direction signal required before opening")
+	maxEntryZ := flag.Float64("max-entry-z", 8, "reject paper entries above this absolute z-score; zero disables")
 	maxPositions := flag.Int("max-positions", 5, "maximum concurrent paper positions")
 	maxGross := flag.Float64("max-gross-usdt", 2_000, "maximum total two-leg paper exposure")
 	sampleInterval := flag.Duration("sample-interval", time.Second, "minimum interval between spread samples per symbol")
 	paperLedgerPath := flag.String("paper-ledger", "var/paper-events.jsonl", "paper event ledger")
 	paperSnapshotPath := flag.String("paper-snapshot", "var/paper-snapshot.json", "latest paper portfolio snapshot")
+	httpAddr := flag.String("http-addr", "127.0.0.1:8080", "read-only dashboard listen address; empty disables")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	dashboardState := dashboard.New()
+	if *httpAddr != "" {
+		server := &http.Server{Addr: *httpAddr, Handler: dashboardState.Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+		go func() {
+			log.Printf("read-only dashboard listening on http://%s", *httpAddr)
+			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("dashboard stopped: %v", err)
+			}
+		}()
+		go func() { <-ctx.Done(); shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second); defer cancel(); _ = server.Shutdown(shutdownCtx) }()
+	}
 
 	httpClient := &http.Client{Timeout: 8 * time.Second}
 	bybitREST := bybit.New(httpClient)
@@ -76,6 +93,7 @@ func main() {
 			MaximumHold: *maxHold, TargetNotional: *targetNotional,
 			BybitFeeBps: *bybitFee, BitgetFeeBps: *bitgetFee, SafetyBpsPerLeg: *safetyBps,
 			MaximumPositions: *maxPositions, MaximumGrossUSDT: *maxGross, SampleInterval: *sampleInterval,
+			MinimumHold: *minHold, EntryConfirm: *entryConfirm, MaximumEntryZ: *maxEntryZ, MaximumBookSkew: *maxBookSkew,
 		})
 		paperLedger = ledger.NewJSONL(*paperLedgerPath)
 		var restored paper.Snapshot
@@ -88,6 +106,7 @@ func main() {
 			log.Fatalf("read paper snapshot: %v", err)
 		}
 		log.Printf("paper trading enabled; no private API or real orders are used")
+		dashboardState.RecordPaper(paperEngine.Snapshot(), nil)
 	}
 
 	updates := make(chan orderbook.Book, 1024)
@@ -102,6 +121,7 @@ func main() {
 			return
 		case book := <-updates:
 			store.Put(book)
+			dashboardState.RecordBook(book)
 			other := "bybit"
 			if book.Exchange == "bybit" {
 				other = "bitget"
@@ -114,7 +134,10 @@ func main() {
 			if now.Sub(book.UpdatedAt) > *maxAge || now.Sub(otherBook.UpdatedAt) > *maxAge {
 				continue
 			}
-			evaluateBothDirections(now, store, book.Symbol, byInstruments[book.Symbol], bgInstruments[book.Symbol], *targetNotional, *minimumNetBps, *bybitFee, *bitgetFee, *safetyBps, lastPrinted)
+			if absDuration(book.UpdatedAt.Sub(otherBook.UpdatedAt)) > *maxBookSkew {
+				continue
+			}
+			evaluateBothDirections(now, store, book.Symbol, byInstruments[book.Symbol], bgInstruments[book.Symbol], *targetNotional, *minimumNetBps, *bybitFee, *bitgetFee, *safetyBps, lastPrinted, dashboardState)
 			if paperEngine != nil {
 				byBook, byOK := store.Get("bybit", book.Symbol)
 				bgBook, bgOK := store.Get("bitget", book.Symbol)
@@ -129,6 +152,7 @@ func main() {
 						}
 					}
 					if len(events) > 0 {
+						dashboardState.RecordPaper(paperEngine.Snapshot(), events)
 						if err := ledger.WriteSnapshot(*paperSnapshotPath, paperEngine.Snapshot()); err != nil {
 							log.Printf("paper snapshot write failed: %v", err)
 						}
@@ -248,7 +272,7 @@ func chooseCandidates(bybitTickers, bitgetTickers map[string]market.Ticker, bybi
 	return symbols
 }
 
-func evaluateBothDirections(now time.Time, store *orderbook.Store, symbol string, byInstrument, bgInstrument market.Instrument, notional, minNet, byFee, bgFee, safety float64, lastPrinted map[string]time.Time) {
+func evaluateBothDirections(now time.Time, store *orderbook.Store, symbol string, byInstrument, bgInstrument market.Instrument, notional, minNet, byFee, bgFee, safety float64, lastPrinted map[string]time.Time, dashboardState *dashboard.State) {
 	byBook, byOK := store.Get("bybit", symbol)
 	bgBook, bgOK := store.Get("bitget", symbol)
 	if !byOK || !bgOK || len(byBook.Asks) == 0 || len(bgBook.Asks) == 0 {
@@ -256,19 +280,20 @@ func evaluateBothDirections(now time.Time, store *orderbook.Store, symbol string
 	}
 	byQuantity, byValid := market.CommonQuantity(notional, byBook.Asks[0].Price, byInstrument, bgInstrument)
 	if byValid {
-		evaluateDirection(now, byBook, bgBook, byQuantity, strategy.DepthConfig{BuyFeeBps: byFee, SellFeeBps: bgFee, SafetyBps: safety, MinimumNetBps: minNet}, lastPrinted)
+		evaluateDirection(now, byBook, bgBook, byQuantity, strategy.DepthConfig{BuyFeeBps: byFee, SellFeeBps: bgFee, SafetyBps: safety, MinimumNetBps: minNet}, lastPrinted, dashboardState)
 	}
 	bgQuantity, bgValid := market.CommonQuantity(notional, bgBook.Asks[0].Price, byInstrument, bgInstrument)
 	if bgValid {
-		evaluateDirection(now, bgBook, byBook, bgQuantity, strategy.DepthConfig{BuyFeeBps: bgFee, SellFeeBps: byFee, SafetyBps: safety, MinimumNetBps: minNet}, lastPrinted)
+		evaluateDirection(now, bgBook, byBook, bgQuantity, strategy.DepthConfig{BuyFeeBps: bgFee, SellFeeBps: byFee, SafetyBps: safety, MinimumNetBps: minNet}, lastPrinted, dashboardState)
 	}
 }
 
-func evaluateDirection(now time.Time, buyBook, sellBook orderbook.Book, quantity float64, config strategy.DepthConfig, lastPrinted map[string]time.Time) {
+func evaluateDirection(now time.Time, buyBook, sellBook orderbook.Book, quantity float64, config strategy.DepthConfig, lastPrinted map[string]time.Time, dashboardState *dashboard.State) {
 	opportunity, err := strategy.EvaluateDepth(buyBook, sellBook, quantity, config)
 	if err != nil {
 		return
 	}
+	dashboardState.RecordOpportunity(now, opportunity)
 	key := opportunity.Symbol + ":" + opportunity.BuyExchange + ":" + opportunity.SellExchange
 	if now.Sub(lastPrinted[key]) < time.Second {
 		return
@@ -278,6 +303,11 @@ func evaluateDirection(now time.Time, buyBook, sellBook orderbook.Book, quantity
 		now.Format(time.RFC3339Nano), opportunity.Symbol, opportunity.BuyExchange+">"+opportunity.SellExchange,
 		opportunity.Quantity, opportunity.BuyAverage, opportunity.SellAverage, opportunity.NetEdgeBps,
 		opportunity.ExpectedPnL, opportunity.BuyLevelsUsed, opportunity.SellLevelsUsed)
+}
+
+func absDuration(value time.Duration) time.Duration {
+	if value < 0 { return -value }
+	return value
 }
 
 func reconnect(ctx context.Context, name string, run func() error) {
