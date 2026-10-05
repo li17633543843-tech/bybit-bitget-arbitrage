@@ -1,0 +1,23 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Runtime state and logs
+var/
+*.log
+
+# Go build output
+bin/
+dist/
+*.exe
+*.test
+*.out
+
+# IDE and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
