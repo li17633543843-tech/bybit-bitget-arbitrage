@@ -56,9 +56,13 @@ go run ./cmd/depthscan \
   -warmup 300 \
   -sample-interval 1s \
   -entry-z 2.5 \
+  -max-entry-z 8 \
+  -entry-confirm 3s \
   -exit-z 0.5 \
   -stop-z 4 \
+  -min-hold 5s \
   -max-hold 2h \
+  -max-book-skew 500ms \
   -max-positions 5 \
   -max-gross-usdt 2000 \
   -bybit-fee-bps 5.5 \
@@ -70,7 +74,19 @@ go run ./cmd/depthscan \
 
 Paper mode maintains an independent rolling log-price spread per symbol. It opens the cheap venue long and the expensive venue short after warmup and an entry Z-score, then closes both legs on convergence, the Z-score stop, or maximum holding time. It charges all four taker fees, multi-level VWAP, a per-leg safety cost, and funding settlements. Only one paper position per symbol is allowed, with global position-count and gross-exposure limits.
 
+Entries must remain beyond the threshold in the same direction for `-entry-confirm`, are rejected when their absolute Z-score exceeds `-max-entry-z`, and require the two exchange books to be within `-max-book-skew`. Convergence exits respect `-min-hold`; stop-loss and maximum-hold exits remain immediate. Bitget funding rate and next settlement time are loaded from its current funding-rate endpoint rather than inferred from ticker data.
+
 Every open, funding, and close event is appended to JSONL. An atomic portfolio snapshot stores open positions, realized equity, wins/losses, peak equity, maximum drawdown, and average holding time. The snapshot is restored automatically after restart; restored positions must warm their rolling window again before a statistical exit is allowed.
+
+### Read-only monitoring dashboard
+
+`depthscan` serves a dashboard and JSON status API on `127.0.0.1:8080` by default:
+
+```bash
+curl http://127.0.0.1:8080/healthz
+```
+
+The page shows recent executable opportunities, open paper positions, realized performance, drawdown, and recent paper events. Keep it bound to localhost and expose it through an authenticated HTTPS reverse proxy. For temporary direct testing only, use `-http-addr :8080` and restrict port 8080 in the cloud firewall to your own IP. Set `-http-addr ''` to disable it.
 
 Fee flags must be changed to the actual fee tier of each account. The funding delta is displayed for context but is not subtracted from the immediate entry spread because its effect depends on holding time and the next settlement times.
 
