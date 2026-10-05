@@ -12,6 +12,7 @@ import (
 )
 
 const tickersURL = "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES"
+const currentFundingURL = "https://api.bitget.com/api/v2/mix/market/current-fund-rate?productType=USDT-FUTURES"
 
 type Client struct{ HTTP exchange.HTTPClient }
 
@@ -36,6 +37,17 @@ type tickerResponse struct {
 	} `json:"data"`
 }
 
+type currentFundingResponse struct {
+	Code string `json:"code"`
+	Msg  string `json:"msg"`
+	Data []struct {
+		Symbol              string `json:"symbol"`
+		FundingRate         string `json:"fundingRate"`
+		FundingRateInterval string `json:"fundingRateInterval"`
+		NextUpdate          string `json:"nextUpdate"`
+	} `json:"data"`
+}
+
 func (c *Client) Tickers(ctx context.Context) (map[string]market.Ticker, error) {
 	var response tickerResponse
 	if err := c.HTTP.GetJSON(ctx, tickersURL, &response); err != nil {
@@ -43,6 +55,13 @@ func (c *Client) Tickers(ctx context.Context) (map[string]market.Ticker, error) 
 	}
 	if response.Code != "00000" {
 		return nil, fmt.Errorf("bitget: code=%s message=%s", response.Code, response.Msg)
+	}
+	var funding currentFundingResponse
+	if err := c.HTTP.GetJSON(ctx, currentFundingURL, &funding); err != nil {
+		return nil, fmt.Errorf("bitget current funding: %w", err)
+	}
+	if funding.Code != "00000" {
+		return nil, fmt.Errorf("bitget current funding: code=%s message=%s", funding.Code, funding.Msg)
 	}
 
 	now := time.Now()
@@ -63,6 +82,15 @@ func (c *Client) Tickers(ctx context.Context) (map[string]market.Ticker, error) 
 		if t.Valid() {
 			result[t.Symbol] = t
 		}
+	}
+	for _, item := range funding.Data {
+		ticker, ok := result[item.Symbol]
+		if !ok {
+			continue
+		}
+		ticker.FundingRate = number(item.FundingRate)
+		ticker.NextFundingAt = millisecondsTime(item.NextUpdate)
+		result[item.Symbol] = ticker
 	}
 	return result, nil
 }
