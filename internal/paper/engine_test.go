@@ -40,6 +40,61 @@ func TestEngineRequiresRoundTripCostsToBeCovered(t *testing.T) {
 	}
 }
 
+func TestEngineRequiresPersistentEntrySignal(t *testing.T) {
+	engine := New(Config{Window: 3, Warmup: 3, EntryZ: 1, ExitZ: .5, StopZ: 20, MaximumEntryZ: 15, EntryConfirm: 2 * time.Second, TargetNotional: 100, MaximumPositions: 1})
+	start := time.Unix(10_000, 0)
+	engine.OnTick(testTick(start, 100, 100))
+	engine.OnTick(testTick(start.Add(time.Second), 100, 100))
+	if events := engine.OnTick(testTick(start.Add(2*time.Second), 102, 100)); len(events) != 0 {
+		t.Fatalf("must not open on the first signal: %+v", events)
+	}
+	if events := engine.OnTick(testTick(start.Add(3*time.Second), 103, 100)); len(events) != 0 {
+		t.Fatalf("must wait for the confirmation duration: %+v", events)
+	}
+	events := engine.OnTick(testTick(start.Add(4*time.Second), 104, 100))
+	if len(events) != 1 || events[0].Type != "OPEN" {
+		t.Fatalf("expected confirmed open, got %+v", events)
+	}
+}
+
+func TestEngineRejectsExtremeEntryZ(t *testing.T) {
+	engine := New(Config{Window: 3, Warmup: 3, EntryZ: 1, MaximumEntryZ: 1.1, TargetNotional: 100, MaximumPositions: 1})
+	start := time.Unix(10_000, 0)
+	engine.OnTick(testTick(start, 100, 100))
+	engine.OnTick(testTick(start.Add(time.Second), 100, 100))
+	if events := engine.OnTick(testTick(start.Add(2*time.Second), 102, 100)); len(events) != 0 {
+		t.Fatalf("extreme z-score must be rejected: %+v", events)
+	}
+}
+
+func TestEngineRequiresMinimumHoldBeforeConvergenceExit(t *testing.T) {
+	engine := New(Config{Window: 3, Warmup: 3, EntryZ: 1, ExitZ: .8, StopZ: 20, MinimumHold: 5 * time.Second, TargetNotional: 100, MaximumPositions: 1})
+	start := time.Unix(10_000, 0)
+	engine.OnTick(testTick(start, 100, 100))
+	engine.OnTick(testTick(start.Add(time.Second), 100, 100))
+	engine.OnTick(testTick(start.Add(2*time.Second), 102, 100))
+	if events := engine.OnTick(testTick(start.Add(3*time.Second), 100, 100)); len(events) != 0 {
+		t.Fatalf("position closed before minimum hold: %+v", events)
+	}
+	events := engine.OnTick(testTick(start.Add(7*time.Second), 100, 100))
+	if len(events) != 1 || events[0].Type != "CLOSE" {
+		t.Fatalf("expected convergence close after minimum hold, got %+v", events)
+	}
+}
+
+func TestEngineRejectsSkewedBooks(t *testing.T) {
+	engine := New(Config{Window: 3, Warmup: 3, MaximumBookSkew: 250 * time.Millisecond})
+	tick := testTick(time.Unix(10_000, 0), 100, 100)
+	tick.BybitBook.UpdatedAt = tick.Now
+	tick.BitgetBook.UpdatedAt = tick.Now.Add(-time.Second)
+	if events := engine.OnTick(tick); len(events) != 0 {
+		t.Fatalf("skewed books must be rejected: %+v", events)
+	}
+	if len(engine.statistics) != 0 {
+		t.Fatal("skewed books must not enter rolling statistics")
+	}
+}
+
 func TestFundingPaysShortAndChargesLong(t *testing.T) {
 	engine := New(Config{Window: 3, Warmup: 3})
 	settlement := time.Unix(20_000, 0)

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/li17633543843-tech/bybit-bitget-arbitrage/internal/market"
@@ -40,6 +41,10 @@ type Config struct {
 	MaximumPositions   int
 	MaximumGrossUSDT   float64
 	SampleInterval     time.Duration
+	MinimumHold        time.Duration
+	EntryConfirm       time.Duration
+	MaximumEntryZ      float64
+	MaximumBookSkew    time.Duration
 }
 
 type Tick struct {
@@ -100,6 +105,7 @@ type Snapshot struct {
 }
 
 type Engine struct {
+	mu          sync.RWMutex
 	config      Config
 	statistics map[string]*statistics.Rolling
 	positions  map[string]Position
@@ -112,6 +118,12 @@ type Engine struct {
 	totalHold time.Duration
 	nextID     uint64
 	lastSample map[string]time.Time
+	entrySignals map[string]entrySignal
+}
+
+type entrySignal struct {
+	direction int
+	since     time.Time
 }
 
 func New(config Config) *Engine {
@@ -124,11 +136,17 @@ func New(config Config) *Engine {
 	if config.MaximumPositions < 1 {
 		config.MaximumPositions = 1
 	}
-	return &Engine{config: config, statistics: make(map[string]*statistics.Rolling), positions: make(map[string]Position), lastSample: make(map[string]time.Time)}
+	return &Engine{config: config, statistics: make(map[string]*statistics.Rolling), positions: make(map[string]Position), lastSample: make(map[string]time.Time), entrySignals: make(map[string]entrySignal)}
 }
 
 func (e *Engine) OnTick(tick Tick) []Event {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if !validTick(tick) {
+		return nil
+	}
+	if e.config.MaximumBookSkew > 0 && absDuration(tick.BybitBook.UpdatedAt.Sub(tick.BitgetBook.UpdatedAt)) > e.config.MaximumBookSkew {
+		delete(e.entrySignals, tick.BybitBook.Symbol)
 		return nil
 	}
 	symbol := tick.BybitBook.Symbol
@@ -162,14 +180,30 @@ func (e *Engine) OnTick(tick Tick) []Event {
 		return events
 	}
 
-	if !rolling.Ready(e.config.Warmup) || math.Abs(stats.ZScore) < e.config.EntryZ || len(e.positions) >= e.config.MaximumPositions {
+	if !rolling.Ready(e.config.Warmup) || math.Abs(stats.ZScore) < e.config.EntryZ || (e.config.MaximumEntryZ > 0 && math.Abs(stats.ZScore) > e.config.MaximumEntryZ) || len(e.positions) >= e.config.MaximumPositions {
+		delete(e.entrySignals, symbol)
 		return events
 	}
 	if math.Abs(spreadBps-stats.Mean) < e.roundTripCostBps() {
+		delete(e.entrySignals, symbol)
+		return events
+	}
+	direction := 1
+	if stats.ZScore < 0 {
+		direction = -1
+	}
+	signal, exists := e.entrySignals[symbol]
+	if !exists || signal.direction != direction {
+		e.entrySignals[symbol] = entrySignal{direction: direction, since: tick.Now}
+		if e.config.EntryConfirm > 0 {
+			return events
+		}
+	} else if tick.Now.Sub(signal.since) < e.config.EntryConfirm {
 		return events
 	}
 	if position, ok := e.openPosition(tick, stats.ZScore, spreadBps); ok {
 		e.positions[symbol] = position
+		delete(e.entrySignals, symbol)
 		events = append(events, Event{Type: "OPEN", Time: tick.Now, Position: position, CurrentZ: stats.ZScore, SpreadBps: spreadBps, Fees: position.EntryFees, SafetyCost: position.EntrySafetyCost, Equity: e.realized})
 	}
 	return events
@@ -297,7 +331,7 @@ func (e *Engine) closeDecision(position Position, zScore float64, now time.Time)
 	if math.Abs(zScore) >= e.config.StopZ && e.config.StopZ > 0 {
 		return CloseStop, true
 	}
-	if math.Abs(zScore) <= e.config.ExitZ {
+	if math.Abs(zScore) <= e.config.ExitZ && now.Sub(position.OpenedAt) >= e.config.MinimumHold {
 		return CloseConvergence, true
 	}
 	if e.config.MaximumHold > 0 && now.Sub(position.OpenedAt) >= e.config.MaximumHold {
@@ -307,6 +341,8 @@ func (e *Engine) closeDecision(position Position, zScore float64, now time.Time)
 }
 
 func (e *Engine) Snapshot() Snapshot {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	positions := make([]Position, 0, len(e.positions))
 	for _, position := range e.positions {
 		positions = append(positions, position)
@@ -320,6 +356,8 @@ func (e *Engine) Snapshot() Snapshot {
 }
 
 func (e *Engine) Restore(snapshot Snapshot) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	positions := make(map[string]Position, len(snapshot.Positions))
 	for _, position := range snapshot.Positions {
 		if position.Symbol == "" || position.Quantity <= 0 || position.ID == "" {
@@ -339,6 +377,13 @@ func (e *Engine) Restore(snapshot Snapshot) error {
 	e.maxDrawdown = snapshot.MaxDrawdown
 	e.totalHold = time.Duration(snapshot.TotalHoldSeconds * float64(time.Second))
 	return nil
+}
+
+func absDuration(value time.Duration) time.Duration {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 func (e *Engine) grossExposure() float64 {
